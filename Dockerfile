@@ -9,22 +9,14 @@
 # extensions/, so the main build layer is not invalidated by unrelated
 # extension source changes.
 #
-# Two runtime variants:
-#   Default (bookworm):      docker build .
-#   Slim (bookworm-slim):    docker build --build-arg OPENCLAW_VARIANT=slim .
+# Runtime image: mcr.microsoft.com/playwright:v1.50.0-noble (Ubuntu 24.04 Noble)
+# Bundles Playwright browsers + system deps. Node.js 24 is installed via
+# NodeSource on top. Designed for air-gapped / pure-intranet deployment:
+# everything is baked in at build time, no downloads at container start.
 ARG OPENCLAW_EXTENSIONS=""
-ARG OPENCLAW_VARIANT=default
-ARG OPENCLAW_NODE_BOOKWORM_IMAGE="node:22-bookworm@sha256:b501c082306a4f528bc4038cbf2fbb58095d583d0419a259b2114b5ac53d12e9"
-ARG OPENCLAW_NODE_BOOKWORM_DIGEST="sha256:b501c082306a4f528bc4038cbf2fbb58095d583d0419a259b2114b5ac53d12e9"
-ARG OPENCLAW_NODE_BOOKWORM_SLIM_IMAGE="node:22-bookworm-slim@sha256:9c2c405e3ff9b9afb2873232d24bb06367d649aa3e6259cbe314da59578e81e9"
-ARG OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST="sha256:9c2c405e3ff9b9afb2873232d24bb06367d649aa3e6259cbe314da59578e81e9"
+ARG OPENCLAW_BASE_IMAGE="mcr.microsoft.com/playwright:v1.50.0-noble"
 
-# Base images are pinned to SHA256 digests for reproducible builds.
-# Trade-off: digests must be updated manually when upstream tags move.
-# To update, run: docker manifest inspect node:22-bookworm (or podman)
-# and replace the digest below with the current multi-arch manifest list entry.
-
-FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS ext-deps
+FROM ${OPENCLAW_BASE_IMAGE} AS ext-deps
 ARG OPENCLAW_EXTENSIONS
 COPY extensions /tmp/extensions
 # Copy package.json for opted-in extensions so pnpm resolves their deps.
@@ -37,13 +29,21 @@ RUN mkdir -p /out && \
     done
 
 # ── Stage 2: Build ──────────────────────────────────────────────
-FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS build
+FROM ${OPENCLAW_BASE_IMAGE} AS build
+
+# Install Node.js 24 via NodeSource (replaces the image's bundled Node 22).
+USER root
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl unzip ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Bun (required for build scripts)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
-RUN corepack enable
+RUN npm install -g corepack@latest && corepack enable
 
 WORKDIR /app
 
@@ -89,25 +89,14 @@ FROM build AS runtime-assets
 RUN CI=true pnpm prune --prod && \
     find dist -type f \( -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' -o -name '*.map' \) -delete
 
-# ── Runtime base images ─────────────────────────────────────────
-FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS base-default
-ARG OPENCLAW_NODE_BOOKWORM_DIGEST
-LABEL org.opencontainers.image.base.name="docker.io/library/node:22-bookworm" \
-  org.opencontainers.image.base.digest="${OPENCLAW_NODE_BOOKWORM_DIGEST}"
-
-FROM ${OPENCLAW_NODE_BOOKWORM_SLIM_IMAGE} AS base-slim
-ARG OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST
-LABEL org.opencontainers.image.base.name="docker.io/library/node:22-bookworm-slim" \
-  org.opencontainers.image.base.digest="${OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST}"
+# ── Runtime base image ──────────────────────────────────────────
+FROM ${OPENCLAW_BASE_IMAGE} AS base-runtime
+LABEL org.opencontainers.image.base.name="mcr.microsoft.com/playwright:v1.50.0-noble"
 
 # ── Stage 3: Runtime ────────────────────────────────────────────
-FROM base-${OPENCLAW_VARIANT}
-ARG OPENCLAW_VARIANT
+FROM base-runtime
 
 # OCI base-image metadata for downstream image consumers.
-# If you change these annotations, also update:
-# - docs/install/docker.md ("Base image metadata" section)
-# - https://docs.openclaw.ai/install/docker
 LABEL org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
   org.opencontainers.image.url="https://openclaw.ai" \
   org.opencontainers.image.documentation="https://docs.openclaw.ai/install/docker" \
@@ -117,13 +106,37 @@ LABEL org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
 
 WORKDIR /app
 
-# Install system utilities present in bookworm but missing in bookworm-slim.
-# On the full bookworm image these are already installed (apt-get is a no-op).
-RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
-    apt-get update && \
+# Install Node.js 24 + system utilities into the runtime image.
+# Everything is installed at build time for air-gapped deployment.
+USER root
+RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      procps hostname curl git openssl
+      curl ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      procps hostname git openssl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Verify versions baked into the image.
+RUN node -v && npm -v && npx playwright --version
+
+# Ensure 'node' user (uid 1000) exists for compatibility with COPY --chown.
+# The Playwright image ships 'pwuser' (uid 1000) instead of 'node'.
+RUN if ! id -u node >/dev/null 2>&1; then \
+      existing_user=$(getent passwd 1000 | cut -d: -f1) && \
+      existing_group=$(getent group 1000 | cut -d: -f1) && \
+      if [ -n "$existing_group" ] && [ "$existing_group" != "node" ]; then \
+        groupmod -n node "$existing_group"; \
+      elif [ -z "$existing_group" ]; then \
+        groupadd -g 1000 node; \
+      fi && \
+      if [ -n "$existing_user" ] && [ "$existing_user" != "node" ]; then \
+        usermod -l node "$existing_user"; \
+      elif [ -z "$existing_user" ]; then \
+        useradd -u 1000 -g 1000 -M -s /bin/bash node; \
+      fi; \
+    fi
 
 RUN chown node:node /app
 
@@ -139,7 +152,8 @@ COPY --from=runtime-assets --chown=node:node /app/docs ./docs
 # Use a shared Corepack home so the non-root `node` user does not need a
 # first-run network fetch when invoking pnpm.
 ENV COREPACK_HOME=/usr/local/share/corepack
-RUN install -d -m 0755 "$COREPACK_HOME" && \
+RUN npm install -g corepack@latest && \
+    install -d -m 0755 "$COREPACK_HOME" && \
     corepack enable && \
     corepack prepare "$(node -p "require('./package.json').packageManager")" --activate && \
     chmod -R a+rX "$COREPACK_HOME"
@@ -147,28 +161,15 @@ RUN install -d -m 0755 "$COREPACK_HOME" && \
 # Install additional system packages needed by your skills or extensions.
 # Example: docker build --build-arg OPENCLAW_DOCKER_APT_PACKAGES="python3 wget" .
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
-RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
-    if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
+RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
+      rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Optionally install Chromium and Xvfb for browser automation.
-# Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
-# Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
-# Must run after node_modules COPY so playwright-core is available.
+# Playwright browsers are already included in the mcr.microsoft.com/playwright base image.
+# No runtime download needed — fully air-gapped compatible.
 ARG OPENCLAW_INSTALL_BROWSER=""
-RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
-    if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
-      mkdir -p /home/node/.cache/ms-playwright && \
-      PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
-      node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
-      chown -R node:node /home/node/.cache/ms-playwright; \
-    fi
 
 # Optionally install Docker CLI for sandbox container management.
 # Build with: docker build --build-arg OPENCLAW_INSTALL_DOCKER_CLI=1 ...
@@ -176,16 +177,14 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
 # Required for agents.defaults.sandbox to function in Docker deployments.
 ARG OPENCLAW_INSTALL_DOCKER_CLI=""
 ARG OPENCLAW_DOCKER_GPG_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
-RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=openclaw-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
-    if [ -n "$OPENCLAW_INSTALL_DOCKER_CLI" ]; then \
+RUN if [ -n "$OPENCLAW_INSTALL_DOCKER_CLI" ]; then \
       apt-get update && \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg && \
       install -m 0755 -d /etc/apt/keyrings && \
       # Verify Docker apt signing key fingerprint before trusting it as a root key.
       # Update OPENCLAW_DOCKER_GPG_FINGERPRINT when Docker rotates release keys.
-      curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.gpg.asc && \
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg.asc && \
       expected_fingerprint="$(printf '%s' "$OPENCLAW_DOCKER_GPG_FINGERPRINT" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')" && \
       actual_fingerprint="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == "fpr" { print toupper($10); exit }')" && \
       if [ -z "$actual_fingerprint" ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then \
@@ -195,11 +194,12 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
       gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg.asc && \
       rm -f /tmp/docker.gpg.asc && \
       chmod a+r /etc/apt/keyrings/docker.gpg && \
-      printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable\n' \
+      printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable\n' \
         "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.list && \
       apt-get update && \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        docker-ce-cli docker-compose-plugin; \
+        docker-ce-cli docker-compose-plugin && \
+      rm -rf /var/lib/apt/lists/*; \
     fi
 
 # Expose the CLI binary without requiring npm global writes as non-root.
@@ -208,9 +208,8 @@ RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
 
 ENV NODE_ENV=production
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
+# Security hardening: Run as non-root user.
+# The 'node' user (uid 1000) was created earlier for COPY --chown compatibility.
 USER node
 
 # Start gateway server with default config.
