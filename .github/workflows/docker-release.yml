@@ -3,16 +3,8 @@ name: Docker Release
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - ".agents/**"
-      - "skills/**"
 
 concurrency:
   group: docker-release-${{ github.workflow }}-${{ github.ref }}
